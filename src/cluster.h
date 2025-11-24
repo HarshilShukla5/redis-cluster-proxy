@@ -35,6 +35,7 @@
 
 struct redisCluster;
 struct clusterNode;
+struct client;
 
 typedef struct redisClusterConnection {
     redisContext *context;
@@ -44,6 +45,8 @@ typedef struct redisClusterConnection {
     int has_read_handler;
     int authenticating;
     int authenticated;
+    int is_pubsub;
+    struct client *pubsub_owner;
     struct clusterNode *node;
 } redisClusterConnection;
 

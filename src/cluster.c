@@ -86,6 +86,8 @@ redisClusterConnection *createClusterConnection(void) {
     conn->connected = 0;
     conn->authenticating = 0;
     conn->authenticated = 0;
+    conn->is_pubsub = 0;
+    conn->pubsub_owner = NULL;
     conn->requests_pending = listCreate();
     if (conn->requests_pending == NULL) {
         zfree(conn);

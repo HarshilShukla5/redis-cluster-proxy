@@ -147,6 +147,10 @@ typedef struct client {
                                       * to private cluster connection */
 
     redisCluster *cluster;
+    int pubsub_mode;
+    clusterNode *pubsub_node;
+    list *pubsub_channels;
+    list *pubsub_patterns;
     int multi_transaction;
     clientRequest *multi_request;
     clusterNode *multi_transaction_node;

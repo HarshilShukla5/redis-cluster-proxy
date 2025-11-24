@@ -111,6 +111,59 @@ redisCommandDef *authCommandDef = NULL;
 redisCommandDef *scanCommandDef = NULL;
 int ae_api_kqueue = 0;
 
+/* Pub/Sub helpers */
+static list *createSdsList(void) {
+    list *l = listCreate();
+    if (l != NULL) listSetFreeMethod(l, (void (*)(void*)) sdsfree);
+    return l;
+}
+
+static int listContainsSds(list *l, const char *ptr, int len) {
+    if (l == NULL) return 0;
+    listIter li;
+    listNode *ln;
+    listRewind(l, &li);
+    while ((ln = listNext(&li))) {
+        sds v = ln->value;
+        if ((int) sdslen(v) == len && memcmp(v, ptr, len) == 0) return 1;
+    }
+    return 0;
+}
+
+static int addSdsToList(list **l, const char *ptr, int len) {
+    if (*l == NULL) *l = createSdsList();
+    if (*l == NULL) return 0;
+    if (listContainsSds(*l, ptr, len)) return 1;
+    sds v = sdsnewlen(ptr, len);
+    if (v == NULL) return 0;
+    return listAddNodeTail(*l, v) != NULL;
+}
+
+static void removeSdsFromList(list **l, const char *ptr, int len) {
+    if (l == NULL || *l == NULL) return;
+    listIter li;
+    listNode *ln;
+    listRewind(*l, &li);
+    while ((ln = listNext(&li))) {
+        sds v = ln->value;
+        if ((int) sdslen(v) == len && memcmp(v, ptr, len) == 0) {
+            listDelNode(*l, ln);
+            break;
+        }
+    }
+    if (listLength(*l) == 0) {
+        listRelease(*l);
+        *l = NULL;
+    }
+}
+
+static void clearSdsList(list **l) {
+    if (l && *l) {
+        listRelease(*l);
+        *l = NULL;
+    }
+}
+
 #ifdef __GNUC__
 __thread int thread_id;
 #else
@@ -138,6 +191,7 @@ static clientRequest *handleNextRequestsToCluster(clusterNode *node,
 static clientRequest *getFirstQueuedRequest(list *queue, int *is_empty);
 static int enqueueRequest(clientRequest *req, int queue_type);
 static void dequeueRequest(clientRequest *req, int queue_type);
+static int isPubSubCommandDef(redisCommandDef *cmd);
 static int sendMessageToThread(proxyThread *thread, sds buf);
 static int installIOHandler(aeEventLoop *el, int fd, int mask, aeFileProc *proc,
                             void *data, int retried);
@@ -677,6 +731,53 @@ int commandWithPrivateConnection(void *r){
     if (!disableMultiplexingForClient(c)) {
         unlinkClient(c);
         return PROXY_COMMAND_HANDLED;
+    }
+    return PROXY_COMMAND_UNHANDLED;
+}
+
+int pubsubCommand(void *r) {
+    clientRequest *req = r;
+    client *c = req->client;
+    const char *name = req->command && req->command->name ?
+                       req->command->name : "";
+    int is_unsubscribe = (
+        strcasecmp(name, "unsubscribe") == 0 ||
+        strcasecmp(name, "punsubscribe") == 0
+    );
+    int is_pattern = (
+        strcasecmp(name, "psubscribe") == 0 ||
+        strcasecmp(name, "punsubscribe") == 0
+    );
+    if (!disableMultiplexingForClient(c)) {
+        unlinkClient(c);
+        return PROXY_COMMAND_HANDLED;
+    }
+    c->pubsub_mode = 1;
+    list **target = (is_pattern ? &c->pubsub_patterns : &c->pubsub_channels);
+    if (req->argc == 1) {
+        if (is_unsubscribe) clearSdsList(target);
+        return PROXY_COMMAND_UNHANDLED;
+    }
+    if (req->offsets_size < req->argc) {
+        unlinkClient(c);
+        return PROXY_COMMAND_HANDLED;
+    }
+    int i;
+    for (i = 1; i < req->argc; i++) {
+        int offset = req->offsets[i];
+        int len = req->lengths[i];
+        if ((size_t) (offset + len) > sdslen(req->buffer)) {
+            unlinkClient(c);
+            return PROXY_COMMAND_HANDLED;
+        }
+        char *arg = req->buffer + offset;
+        if (is_unsubscribe) removeSdsFromList(target, arg, len);
+        else {
+            if (!addSdsToList(target, arg, len)) {
+                unlinkClient(c);
+                return PROXY_COMMAND_HANDLED;
+            }
+        }
     }
     return PROXY_COMMAND_UNHANDLED;
 }
@@ -1677,6 +1778,14 @@ redisCommandDef *getRedisCommand(sds name) {
     return cmd;
 }
 
+static int isPubSubCommandDef(redisCommandDef *cmd) {
+    if (cmd == NULL || cmd->name == NULL) return 0;
+    return !strcasecmp(cmd->name, "subscribe") ||
+           !strcasecmp(cmd->name, "psubscribe") ||
+           !strcasecmp(cmd->name, "unsubscribe") ||
+           !strcasecmp(cmd->name, "punsubscribe");
+}
+
 void printHelp(void) {
     fprintf(stderr, mainHelpString,
         DEFAULT_PORT, DEFAULT_MAX_CLIENTS, DEFAULT_THREADS, MAX_THREADS,
@@ -2210,6 +2319,7 @@ static int populateConnectionsPool(proxyThread *thread, int rate) {
 static int recyclePrivateClusterConnection(client *c) {
     redisCluster *cluster = c->cluster;
     assert(cluster != NULL);
+    if (c->pubsub_mode) return 0;
     if (cluster->broken || cluster->is_updating || cluster->update_required)
         return 0;
     proxyThread *thread = getThread(c);
@@ -2249,6 +2359,8 @@ static int recyclePrivateClusterConnection(client *c) {
             clientRequest *req = listNodeValue(nln);
             if (req != NULL) goto fail;
         }
+        conn->is_pubsub = 0;
+        conn->pubsub_owner = NULL;
         /* Reset connection lists and node.*/
         listEmpty(conn->requests_to_send);
         listEmpty(conn->requests_pending);
@@ -2535,6 +2647,10 @@ static client *createClient(int fd, char *ip) {
     c->reply_array = NULL;
     c->current_request = NULL;
     c->cluster = NULL;
+    c->pubsub_mode = 0;
+    c->pubsub_node = NULL;
+    c->pubsub_channels = NULL;
+    c->pubsub_patterns = NULL;
     anetNonBlock(NULL, fd);
     anetEnableTcpNoDelay(NULL, fd);
     if (config.tcpkeepalive)
@@ -2815,6 +2931,8 @@ static void freeClient(client *c) {
     listRelease(c->requests);
     if (c->unordered_replies)
         raxFreeWithCallback(c->unordered_replies, (void (*)(void*))sdsfree);
+    clearSdsList(&c->pubsub_channels);
+    clearSdsList(&c->pubsub_patterns);
     if (c->cluster != NULL) {
         freeCluster(c->cluster);
     }
@@ -3166,6 +3284,8 @@ void onClusterNodeDisconnection(clusterNode *node) {
         }
         sdsfree(err);
     }
+    connection->is_pubsub = 0;
+    connection->pubsub_owner = NULL;
 }
 
 static int listen(void) {
@@ -4097,6 +4217,13 @@ static int sendRequestToCluster(clientRequest *req, sds *errmsg)
     if (cluster->owner && cluster->owner == req->client)
         req->owned_by_client = 1;
     aeEventLoop *el = getClientLoop(req->client);
+    redisClusterConnection *conn = req->node->connection;
+    assert(conn != NULL);
+    if (isPubSubCommandDef(req->command)) {
+        conn->is_pubsub = 1;
+        conn->pubsub_owner = req->client;
+        req->client->pubsub_node = req->node;
+    }
     redisContext *ctx = getClusterNodeContext(req->node);
     if (ctx == NULL) {
         if ((ctx = clusterNodeConnect(req->node)) == NULL) {
@@ -4132,8 +4259,6 @@ static int sendRequestToCluster(clientRequest *req, sds *errmsg)
     } else if (!isClusterNodeConnected(req->node)) {
         return 1;
     }
-    redisClusterConnection *conn = req->node->connection;
-    assert(conn != NULL);
     if (!conn->has_read_handler) {
         if (!installIOHandler(el, ctx->fd, AE_READABLE, readClusterReply,
                               conn, 0))
@@ -4555,6 +4680,7 @@ static int processClusterReplyBuffer(redisContext *ctx, clusterNode *node,
         /* Reply not yet available, just return */
         if (ok && reply == NULL) break;
         replies++;
+        redisClusterConnection *conn = node->connection;
         clientRequest *req = getFirstRequestPending(node, NULL);
         int free_req = 1;
         /* If request is NULL, it's a ghost request that is a NULL
@@ -4563,16 +4689,27 @@ static int processClusterReplyBuffer(redisContext *ctx, clusterNode *node,
          * node containing the NULL placeholder and directly skip to
          * 'consume_buffer' in order to process the remaining reply buffer. */
         if (req == NULL) {
-            list *queue = node->connection->requests_pending;
-            /* It should never happen that the request is NULL because of an
-             * empty queue while we still have reply buffer to process */
-            if (listLength(queue) == 0) {
-                logClusterReplyFailure("listLength(queue) > 0", reply, node);
-                assert(listLength(queue) > 0);
+            if (errmsg == NULL && conn && conn->is_pubsub &&
+                conn->pubsub_owner != NULL)
+            {
+                client *pc = conn->pubsub_owner;
+                char *obuf = ctx->reader->buf;
+                size_t len = ctx->reader->pos;
+                if (len > ctx->reader->len) len = ctx->reader->len;
+                addReplyRaw(pc, obuf, len, pc->min_reply_id);
+                goto consume_buffer;
+            } else {
+                list *queue = node->connection->requests_pending;
+                /* It should never happen that the request is NULL because of an
+                 * empty queue while we still have reply buffer to process */
+                if (listLength(queue) == 0) {
+                    logClusterReplyFailure("listLength(queue) > 0", reply, node);
+                    assert(listLength(queue) > 0);
+                }
+                listNode *ln = listFirst(queue);
+                listDelNode(queue, ln);
+                goto consume_buffer;
             }
-            listNode *ln = listFirst(queue);
-            listDelNode(queue, ln);
-            goto consume_buffer;
         } else if (req == req->client->multi_request) {
             /* Since we've already replied "OK" to the first handled MULTI
              * query received, we'll skip the actual MULTI's reply received
@@ -4760,6 +4897,9 @@ static void readClusterReply(aeEventLoop *el, int fd,
         } else {
             listNode *first = listFirst(queue);
             if (first) listDelNode(queue, first);
+            else if (connection->is_pubsub && connection->pubsub_owner) {
+                addReplyError(connection->pubsub_owner, errmsg, 0);
+            }
         }
         if (connection->authenticating) {
             connection->authenticating = 0;

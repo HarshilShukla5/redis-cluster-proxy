@@ -143,6 +143,10 @@ void addReplyErrorWrongArgc(client *c, const char *cmdname, uint64_t req_id) {
 }
 
 void addReplyRaw(client *c, const char *buf, size_t len, uint64_t req_id) {
+    if (c->pubsub_mode && (sdslen(c->obuf) + len) > PROXY_PUBSUB_OBUF_LIMIT) {
+        unlinkClient(c);
+        return;
+    }
     /* If the smallest request ID written is smaller than reply's request ID,
      *  replies are not ordered, so add the reply to the unordered_replies rax
      * using the request ID as the key. */

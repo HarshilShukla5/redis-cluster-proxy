@@ -43,6 +43,8 @@
 #define PROXY_MAIN_THREAD_ID -1
 #define PROXY_UNKN_THREAD_ID -999
 
+#define PROXY_PUBSUB_OBUF_LIMIT (64 * 1024 * 1024) /* 64MB */
+
 #define getClientLoop(c) (proxy.threads[c->thread_id]->loop)
 
 struct client;
@@ -151,6 +153,7 @@ typedef struct client {
     clusterNode *pubsub_node;
     list *pubsub_channels;
     list *pubsub_patterns;
+    int pubsub_resubscribing;
     int multi_transaction;
     clientRequest *multi_request;
     clusterNode *multi_transaction_node;
@@ -172,5 +175,6 @@ int processRequest(clientRequest *req, int *parsing_status,
 void freeRequest(clientRequest *req);
 void freeRequestList(list *request_list);
 void onClusterNodeDisconnection(clusterNode *node);
+void unlinkClient(client *c);
 
 #endif /* __REDIS_CLUSTER_PROXY_H__ */

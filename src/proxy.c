@@ -164,6 +164,97 @@ static void clearSdsList(list **l) {
     }
 }
 
+static clusterNode *choosePubSubNode(client *c) {
+    redisCluster *cluster = getCluster(c);
+    if (cluster == NULL || cluster->broken) return NULL;
+    clusterNode *node = c->pubsub_node;
+    if (node && node->connection) return node;
+    return getFirstMappedNode(cluster);
+}
+
+static clientRequest *buildPubSubRequest(client *c, const char *cmd,
+                                         list *args, clusterNode *node) {
+    size_t cmdlen = strlen(cmd);
+    int argc = 1 + (args ? (int) listLength(args) : 0);
+    clientRequest *req = createRequest(c);
+    if (req == NULL) return NULL;
+    if (!requestMakeRoomForArgs(req, argc)) {
+        freeRequest(req);
+        return NULL;
+    }
+    sds buf = sdsempty();
+    buf = sdscatfmt(buf, "*%i\r\n$%i\r\n", argc, (int) cmdlen);
+    int offset = sdslen(buf);
+    buf = sdscatlen(buf, cmd, cmdlen);
+    buf = sdscat(buf, "\r\n");
+    req->offsets[0] = offset;
+    req->lengths[0] = (int) cmdlen;
+    int idx = 1;
+    if (args) {
+        listIter li;
+        listNode *ln;
+        listRewind(args, &li);
+        while ((ln = listNext(&li))) {
+            sds arg = ln->value;
+            size_t alen = sdslen(arg);
+            buf = sdscatfmt(buf, "$%i\r\n", (int) alen);
+            offset = sdslen(buf);
+            buf = sdscatlen(buf, arg, alen);
+            buf = sdscat(buf, "\r\n");
+            req->offsets[idx] = offset;
+            req->lengths[idx] = (int) alen;
+            idx++;
+        }
+    }
+    req->buffer = buf;
+    req->argc = argc;
+    req->parsed = 1;
+    req->is_multibulk = 1;
+    req->pending_bulks = 0;
+    req->current_bulk_length = 0;
+    req->node = node;
+    req->slot = UNDEFINED_SLOT;
+    req->owned_by_client = (c->cluster != NULL);
+    sds cmdname = sdsnewlen(cmd, cmdlen);
+    req->command = getRedisCommand(cmdname);
+    sdsfree(cmdname);
+    if (req->command == NULL) {
+        freeRequest(req);
+        return NULL;
+    }
+    return req;
+}
+
+static int enqueuePubSubResubscribe(client *c, const char *cmd, list *args,
+                                    clusterNode *node)
+{
+    if (args == NULL || listLength(args) == 0) return 1;
+    clientRequest *req = buildPubSubRequest(c, cmd, args, node);
+    if (req == NULL) return 0;
+    if (!enqueueRequestToSend(req)) {
+        freeRequest(req);
+        return 0;
+    }
+    handleNextRequestsToCluster(node, NULL);
+    return 1;
+}
+
+static int resubscribeClientPubSub(client *c) {
+    if (!c->pubsub_mode) return 1;
+    if (c->pubsub_resubscribing) return 1;
+    if (c->pubsub_channels == NULL && c->pubsub_patterns == NULL) return 1;
+    clusterNode *node = choosePubSubNode(c);
+    if (node == NULL) return 0;
+    c->pubsub_node = node;
+    c->pubsub_resubscribing = 1;
+    int ok = enqueuePubSubResubscribe(c, "SUBSCRIBE", c->pubsub_channels,
+                                      node);
+    if (ok) ok = enqueuePubSubResubscribe(c, "PSUBSCRIBE",
+                                          c->pubsub_patterns, node);
+    c->pubsub_resubscribing = 0;
+    return ok;
+}
+
 #ifdef __GNUC__
 __thread int thread_id;
 #else
@@ -176,7 +267,7 @@ static proxyThread *createProxyThread(int index);
 static void freeProxyThread(proxyThread *thread);
 static void *execProxyThread(void *ptr);
 static client *createClient(int fd, char *ip);
-static void unlinkClient(client *c);
+void unlinkClient(client *c);
 static void freeClient(client *c);
 static clientRequest *createRequest(client *c);
 void readQuery(aeEventLoop *el, int fd, void *privdata, int mask);
@@ -196,6 +287,7 @@ static int sendMessageToThread(proxyThread *thread, sds buf);
 static int installIOHandler(aeEventLoop *el, int fd, int mask, aeFileProc *proc,
                             void *data, int retried);
 static int disableMultiplexingForClient(client *c);
+static int requestMakeRoomForArgs(clientRequest *req, int argc);
 char *redisClusterProxyGitSHA1(void);
 char *redisClusterProxyGitDirty(void);
 char *redisClusterProxyGitBranch(void);
@@ -753,9 +845,22 @@ int pubsubCommand(void *r) {
         return PROXY_COMMAND_HANDLED;
     }
     c->pubsub_mode = 1;
+    if (c->pubsub_node == NULL) c->pubsub_node = choosePubSubNode(c);
     list **target = (is_pattern ? &c->pubsub_patterns : &c->pubsub_channels);
     if (req->argc == 1) {
-        if (is_unsubscribe) clearSdsList(target);
+        if (is_unsubscribe) {
+            clearSdsList(target);
+            if (c->pubsub_channels == NULL && c->pubsub_patterns == NULL) {
+                c->pubsub_mode = 0;
+                c->pubsub_node = NULL;
+                redisClusterConnection *conn = (req->node ?
+                    req->node->connection : NULL);
+                if (conn) {
+                    conn->is_pubsub = 0;
+                    conn->pubsub_owner = NULL;
+                }
+            }
+        }
         return PROXY_COMMAND_UNHANDLED;
     }
     if (req->offsets_size < req->argc) {
@@ -777,6 +882,17 @@ int pubsubCommand(void *r) {
                 unlinkClient(c);
                 return PROXY_COMMAND_HANDLED;
             }
+        }
+    }
+    if (c->pubsub_channels == NULL && c->pubsub_patterns == NULL &&
+        is_unsubscribe)
+    {
+        c->pubsub_mode = 0;
+        c->pubsub_node = NULL;
+        redisClusterConnection *conn = (req->node ? req->node->connection : NULL);
+        if (conn) {
+            conn->is_pubsub = 0;
+            conn->pubsub_owner = NULL;
         }
     }
     return PROXY_COMMAND_UNHANDLED;
@@ -2845,7 +2961,7 @@ static void closeClientPrivateConnection(client *c) {
     }
 }
 
-static void unlinkClient(client *c) {
+void unlinkClient(client *c) {
     if (c->status == CLIENT_STATUS_UNLINKED) return;
     proxyLogDebug("Unlink client %d:%" PRId64, c->thread_id, c->id);
     aeEventLoop *el = getClientLoop(c);
@@ -3865,6 +3981,12 @@ cleanup:
 static clusterNode *getRequestNode(clientRequest *req, sds *err) {
     clusterNode *node = NULL;
     if (req->node && req->command == scanCommandDef) return req->node;
+    if (isPubSubCommandDef(req->command)) {
+        node = req->client->pubsub_node;
+        if (node == NULL) node = getFirstMappedNode(getCluster(req->client));
+        req->node = node;
+        return node;
+    }
     int first_key = req->command->first_key,
         last_key = req->command->last_key,
         key_step = req->command->key_step, i;
@@ -4398,6 +4520,10 @@ int processRequest(clientRequest *req, int *parsing_status,
         proxyLogDebug("%s", errmsg);
         goto invalid_request;
     }
+    if (c->pubsub_mode && !isPubSubCommandDef(cmd)) {
+        errmsg = sdsnew("ERR only (P)SUBSCRIBE allowed in pubsub mode");
+        goto invalid_request;
+    }
     req->command = cmd;
     if (cmd->handle && cmd->handle(req) == PROXY_COMMAND_HANDLED) {
         if (command_name) sdsfree(command_name);
@@ -4752,6 +4878,13 @@ static int processClusterReplyBuffer(redisContext *ctx, clusterNode *node,
                     goto consume_buffer;
                 }
             }
+            if (isPubSubCommandDef(req->command) &&
+                (strstr(reply->str, "ASK") == reply->str ||
+                 strstr(reply->str, "MOVED") == reply->str))
+            {
+                req->client->pubsub_node = NULL;
+                node->connection->is_pubsub = 0;
+            }
         }
         if (errmsg != NULL) addReplyError(req->client, errmsg, req->id);
         else {
@@ -4844,6 +4977,11 @@ clean:
         if (req && free_req) freeRequest(req);
         if (!ok || do_break) break;
     }
+    if (node->connection && node->connection->pubsub_owner &&
+        !node->connection->is_pubsub)
+    {
+        resubscribeClientPubSub(node->connection->pubsub_owner);
+    }
     return replies;
 }
 
@@ -4910,6 +5048,13 @@ static void readClusterReply(aeEventLoop *el, int fd,
             if (node) clusterNodeDisconnect(node);
         }
         sdsfree(errmsg);
+        if (connection->is_pubsub && connection->pubsub_owner) {
+            connection->is_pubsub = 0;
+            client *pc = connection->pubsub_owner;
+            pc->pubsub_node = NULL;
+            if (!resubscribeClientPubSub(pc))
+                addReplyError(pc, ERROR_NODE_DISCONNECTED, 0);
+        }
         /* Exit, since an error occurred. */
         return;
     } else if (connection->authenticating) {
